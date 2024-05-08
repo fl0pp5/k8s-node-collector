@@ -16,15 +16,15 @@ const (
 	Kind = "NodeInfo"
 )
 
-//go:embed config/k8s
+//go:embed config/specs
 var config embed.FS
 
 //go:embed config
 var params embed.FS
 
 // LoadConfig load audit commands specification from config file
-func LoadConfig(target string, configMap map[string]string) (map[string]*SpecInfo, error) {
-	fullPath := fmt.Sprintf("%s/%s", configFolder, target)
+func LoadConfig(configMap map[string]string) (map[string]*SpecInfo, error) {
+	fullPath := fmt.Sprintf("%s/%s", configFolder, "specs")
 	dirEntries, err := config.ReadDir(fullPath)
 	if err != nil {
 		return nil, err
@@ -121,9 +121,16 @@ type Info struct {
 }
 
 type Config struct {
-	Node NodeParams `yaml:"node"`
+	Node           NodeParams               `yaml:"node"`
+	VersionMapping map[string][]SpecVersion `yaml:"version_mapping"`
 }
 
+type SpecVersion struct {
+	Name    string
+	Version string `yaml:"cluster_version"`
+	Op      string `yaml:"op"`
+	CisSpec string `yaml:"spec"`
+}
 type NodeParams struct {
 	APIserver         Params            `yaml:"apiserver"`
 	ControllerManager Params            `yaml:"controllermanager"`

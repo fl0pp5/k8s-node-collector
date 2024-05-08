@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -14,25 +15,18 @@ import (
 
 	"strconv"
 
+	"github.com/Masterminds/semver"
 	"github.com/spf13/cobra"
 )
 
-type SpecVersion struct {
-	Name    string
-	Version string
-}
-
-var platfromSpec = map[string]SpecVersion{
-	"k8s-1.23": {
-		Name:    "k8s-cis",
-		Version: "1.23",
-	},
-}
+const (
+	// Version is the version of the output
+	defaultSpec = "k8s-cis-1.23.0"
+)
 
 // CollectData run spec audit command and output it result data
-func CollectData(cmd *cobra.Command, target string) error {
+func CollectData(cmd *cobra.Command) error {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
 	cluster, err := GetCluster()
 	if err != nil {
 		return err
@@ -45,10 +39,6 @@ func CollectData(cmd *cobra.Command, target string) error {
 			log.Println("Increase --timeout value")
 		}
 	}()
-	p, err := cluster.Platfrom()
-	if err != nil {
-		return err
-	}
 	shellCmd := NewShellCmd()
 	nodeType, err := shellCmd.FindNodeType()
 	if err != nil {
@@ -59,19 +49,17 @@ func CollectData(cmd *cobra.Command, target string) error {
 		return err
 	}
 	cm := configParams(lp, shellCmd)
-	infoCollectorMap, err := LoadConfig(target, cm)
+	infoCollectorMap, err := LoadConfig(cm)
 	if err != nil {
 		return err
 	}
-	specName := cmd.Flag("spec").Value.String()
-	specVersion := cmd.Flag("version").Value.String()
-	sv := SpecVersion{Name: specName, Version: specVersion}
-	if len(sv.Name) == 0 || len(sv.Version) == 0 {
-		sv = specByPlatfromVersion(p)
+	sv, err := specID(cmd, cluster, lp)
+	if err != nil {
+		return err
 	}
 	for _, infoCollector := range infoCollectorMap {
 		nodeInfo := make(map[string]*Info)
-		if !(infoCollector.Version == sv.Version && infoCollector.Name == sv.Name) {
+		if fmt.Sprintf("%s-%s", infoCollector.Name, infoCollector.Version) != sv {
 			continue
 		}
 		for _, ci := range infoCollector.Collectors {
@@ -86,14 +74,17 @@ func CollectData(cmd *cobra.Command, target string) error {
 			nodeInfo[ci.Key] = &Info{Values: values}
 		}
 		nodeName := cmd.Flag("node").Value.String()
-		nodeConfig, err := loadNodeConfig(ctx, *cluster, nodeName)
-		if err == nil {
-			mapping, err := LoadKubeletMapping()
-			if err != nil {
-				return err
+		kubeletConfig := cmd.Flag("kubelet-config").Value.String()
+		if nodeName != "" || kubeletConfig != "" {
+			nodeConfig, err := loadNodeConfig(ctx, *cluster, nodeName, kubeletConfig)
+			if err == nil {
+				mapping, err := LoadKubeletMapping()
+				if err != nil {
+					return err
+				}
+				configVal := getValuesFromkubeletConfig(nodeConfig, mapping)
+				mergeConfigValues(nodeInfo, configVal)
 			}
-			configVal := getValuesFromkubeletConfig(nodeConfig, mapping)
-			mergeConfigValues(nodeInfo, configVal)
 		}
 		nodeData := Node{
 			APIVersion: Version,
@@ -111,8 +102,37 @@ func CollectData(cmd *cobra.Command, target string) error {
 	return nil
 }
 
-func loadNodeConfig(ctx context.Context, cluster Cluster, nodeName string) (map[string]interface{}, error) {
-	data, err := cluster.clientSet.RESTClient().Get().AbsPath(fmt.Sprintf("/api/v1/nodes/%s/proxy/configz", nodeName)).DoRaw(ctx)
+func specID(cmd *cobra.Command, cluster *Cluster, lp *Config) (string, error) {
+	specName := cmd.Flag("spec-name").Value.String()
+	specVersion := cmd.Flag("spec-version").Value.String()
+	clusterVersion := cmd.Flag("cluster-version").Value.String()
+	switch {
+	case specName != "" && specVersion != "":
+		return fmt.Sprintf("%s-%s", specName, specVersion), nil
+	case specName != "" && clusterVersion != "":
+		return specByPlatfromVersion(
+			Platform{
+				Name:    strings.TrimSuffix(specName, "-cis"),
+				Version: majorVersion(clusterVersion),
+			},
+			lp.VersionMapping), nil
+	default: // auto detect spec by platform type (k8s, aks, eks and etc) and version
+		p, err := cluster.Platfrom()
+		if err != nil {
+			return "", err
+		}
+		return specByPlatfromVersion(p, lp.VersionMapping), nil
+	}
+}
+
+func loadNodeConfig(ctx context.Context, cluster Cluster, nodeName string, kubeletConfig string) (map[string]interface{}, error) {
+	var data []byte
+	var err error
+	if kubeletConfig != "" {
+		data, err = base64.StdEncoding.DecodeString(kubeletConfig)
+	} else {
+		data, err = cluster.clientSet.RESTClient().Get().AbsPath(fmt.Sprintf("/api/v1/nodes/%s/proxy/configz", nodeName)).DoRaw(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +144,26 @@ func loadNodeConfig(ctx context.Context, cluster Cluster, nodeName string) (map[
 	return nodeConfig, nil
 }
 
-func specByPlatfromVersion(platfrom Platform) SpecVersion {
-	return platfromSpec[fmt.Sprintf("%s-%s", platfrom.Name, platfrom.Version)]
+func specByPlatfromVersion(platfrom Platform, versionSpecMapper map[string][]SpecVersion) string {
+	speVersions, ok := versionSpecMapper[platfrom.Name]
+	if ok {
+		for _, cisVer := range speVersions {
+			c, err := semver.NewConstraint(fmt.Sprintf("%s %s", cisVer.Op, cisVer.Version))
+			if err != nil {
+				// default to basic k8s spec
+				return defaultSpec
+			}
+			v, err := semver.NewVersion(platfrom.Version)
+			if err != nil {
+				// default to basic k8s spec
+				return defaultSpec
+			}
+			if ok, _ = c.Validate(v); ok {
+				return cisVer.CisSpec
+			}
+		}
+	}
+	return defaultSpec
 }
 
 func getValuesFromkubeletConfig(nodeConfig map[string]interface{}, configMapper map[string]string) map[string]*Info {
