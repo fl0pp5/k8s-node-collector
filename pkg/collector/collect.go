@@ -17,6 +17,7 @@ import (
 
 	"github.com/Masterminds/semver"
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -44,7 +45,9 @@ func CollectData(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	lp, err := LoadConfigParams()
+	nodeFileconfig := cmd.Flag("node-config").Value.String()
+	specVersionMapping := cmd.Flag("spec-version-mapping").Value.String()
+	lp, mp, err := LoadConfigParams(nodeFileconfig, specVersionMapping)
 	if err != nil {
 		return err
 	}
@@ -53,59 +56,89 @@ func CollectData(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	sv, err := specID(cmd, cluster, lp)
+	specName := cmd.Flag("spec-name").Value.String()
+	specVersion := cmd.Flag("spec-version").Value.String()
+	clusterVersion := cmd.Flag("cluster-version").Value.String()
+	sv, err := specID(specName, specVersion, clusterVersion, cluster, mp)
 	if err != nil {
 		return err
 	}
-	for _, infoCollector := range infoCollectorMap {
-		nodeInfo := make(map[string]*Info)
-		if fmt.Sprintf("%s-%s", infoCollector.Name, infoCollector.Version) != sv {
-			continue
-		}
-		for _, ci := range infoCollector.Collectors {
-			if ci.NodeType != nodeType && nodeType != MasterNode {
-				continue
-			}
-			output, err := shellCmd.Execute(ci.Audit)
+	nodeCommands := cmd.Flag("node-commands").Value.String()
+	commands, err := GetNodesCommands(nodeCommands, infoCollectorMap, nodeType, sv)
+	if len(commands) == 0 {
+		return fmt.Errorf("spec not found")
+	}
+	nodeInfo, err := ExecuteCommands(shellCmd, commands)
+	if err != nil {
+		return err
+	}
+	nodeName := cmd.Flag("node").Value.String()
+	kubeletConfig := cmd.Flag("kubelet-config").Value.String()
+	if nodeName != "" || kubeletConfig != "" {
+		nodeConfig, err := loadNodeConfig(ctx, *cluster, nodeName, kubeletConfig)
+		if err == nil {
+			kubeletConfigMapping := cmd.Flag("kubelet-config-mapping").Value.String()
+			mapping, err := LoadKubeletMapping(kubeletConfigMapping)
 			if err != nil {
 				return err
 			}
-			values := StringToArray(output, ",")
-			nodeInfo[ci.Key] = &Info{Values: values}
+			configVal := getValuesFromkubeletConfig(nodeConfig, mapping)
+			mergeConfigValues(nodeInfo, configVal)
 		}
-		nodeName := cmd.Flag("node").Value.String()
-		kubeletConfig := cmd.Flag("kubelet-config").Value.String()
-		if nodeName != "" || kubeletConfig != "" {
-			nodeConfig, err := loadNodeConfig(ctx, *cluster, nodeName, kubeletConfig)
-			if err == nil {
-				mapping, err := LoadKubeletMapping()
-				if err != nil {
-					return err
-				}
-				configVal := getValuesFromkubeletConfig(nodeConfig, mapping)
-				mergeConfigValues(nodeInfo, configVal)
-			}
-		}
-		nodeData := Node{
-			APIVersion: Version,
-			Kind:       Kind,
-			Type:       nodeType,
-			Metadata:   map[string]string{"creationTimestamp": time.Now().Format(time.RFC3339)},
-			Info:       nodeInfo,
-		}
-		outputFormat := cmd.Flag("output").Value.String()
-		err = printOutput(nodeData, outputFormat, os.Stdout)
-		if err != nil {
-			return err
-		}
+	}
+	nodeData := Node{
+		APIVersion: Version,
+		Kind:       Kind,
+		Type:       nodeType,
+		Metadata:   map[string]string{"creationTimestamp": time.Now().Format(time.RFC3339)},
+		Info:       nodeInfo,
+	}
+	outputFormat := cmd.Flag("output").Value.String()
+	err = printOutput(nodeData, outputFormat, os.Stdout)
+	if err != nil {
+		return err
 	}
 	return nil
 }
 
-func specID(cmd *cobra.Command, cluster *Cluster, lp *Config) (string, error) {
-	specName := cmd.Flag("spec-name").Value.String()
-	specVersion := cmd.Flag("spec-version").Value.String()
-	clusterVersion := cmd.Flag("cluster-version").Value.String()
+func GetNodesCommands(nodeCommands string, infoCollectorMap map[string]*SpecInfo, nodeType string, sv string) ([]Command, error) {
+	var commands []Command
+	var specInfo SpecInfo
+	if nodeCommands != "" {
+		base64Commands, err := base64.StdEncoding.DecodeString(nodeCommands)
+		if err != nil {
+			return nil, err
+		}
+		err = yaml.Unmarshal(base64Commands, &specInfo)
+		if err != nil {
+			return nil, err
+		}
+		commands = specInfo.Commands
+	} else {
+		for _, infoCollector := range infoCollectorMap {
+			if fmt.Sprintf("%s-%s", infoCollector.Name, infoCollector.Version) == sv {
+				commands = infoCollector.Commands
+				break
+			}
+		}
+	}
+	return commands, nil
+}
+
+func ExecuteCommands(shellCmd Shell, ci []Command) (map[string]*Info, error) {
+	nodeInfo := make(map[string]*Info)
+	for _, c := range ci {
+		output, err := shellCmd.Execute(c.Audit)
+		if err != nil {
+			return nil, err
+		}
+		values := StringToArray(output, ",")
+		nodeInfo[c.Key] = &Info{Values: values}
+	}
+	return nodeInfo, nil
+}
+
+func specID(specName, specVersion, clusterVersion string, cluster *Cluster, mp *Mapper) (string, error) {
 	switch {
 	case specName != "" && specVersion != "":
 		return fmt.Sprintf("%s-%s", specName, specVersion), nil
@@ -115,13 +148,13 @@ func specID(cmd *cobra.Command, cluster *Cluster, lp *Config) (string, error) {
 				Name:    strings.TrimSuffix(specName, "-cis"),
 				Version: majorVersion(clusterVersion),
 			},
-			lp.VersionMapping), nil
+			mp.VersionMapping), nil
 	default: // auto detect spec by platform type (k8s, aks, eks and etc) and version
 		p, err := cluster.Platfrom()
 		if err != nil {
 			return "", err
 		}
-		return specByPlatfromVersion(p, lp.VersionMapping), nil
+		return specByPlatfromVersion(p, mp.VersionMapping), nil
 	}
 }
 

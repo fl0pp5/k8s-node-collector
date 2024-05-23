@@ -2,6 +2,7 @@ package collector
 
 import (
 	"embed"
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -49,20 +50,43 @@ func LoadConfig(configMap map[string]string) (map[string]*SpecInfo, error) {
 }
 
 // LoadConfigParams load audit params data
-func LoadConfigParams() (*Config, error) {
-	fullPath := fmt.Sprintf("%s/%s", configFolder, "config.yaml")
-	fContent, err := params.ReadFile(fullPath)
-	if err != nil {
-		return nil, err
+func LoadConfigParams(nodeFileconfig, specVersionMapping string) (*Config, *Mapper, error) {
+	var decodedNodeFileconfig, decodedspecVersionMapping []byte
+	var err error
+	if nodeFileconfig != "" && specVersionMapping != "" {
+		decodedNodeFileconfig, err = base64.StdEncoding.DecodeString(nodeFileconfig)
+		if err != nil {
+			return nil, nil, err
+		}
+		decodedspecVersionMapping, err = base64.StdEncoding.DecodeString(specVersionMapping)
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		fullPath := fmt.Sprintf("%s/%s", configFolder, "config.yaml")
+		decodedNodeFileconfig, err = params.ReadFile(fullPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		decodedspecVersionMapping = decodedNodeFileconfig
 	}
-	return getNodeParams(string(fContent))
+	return getNodeParams(string(decodedNodeFileconfig), string(decodedspecVersionMapping))
 }
 
-func LoadKubeletMapping() (map[string]string, error) {
-	fullPath := fmt.Sprintf("%s/%s", configFolder, "kubeletconfig-mapping.yaml")
-	fContent, err := params.ReadFile(fullPath)
-	if err != nil {
-		return nil, err
+func LoadKubeletMapping(kubletConfigMapping string) (map[string]string, error) {
+	var fContent []byte
+	var err error
+	if len(kubletConfigMapping) > 0 {
+		fContent, err = base64.StdEncoding.DecodeString(kubletConfigMapping)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		fullPath := fmt.Sprintf("%s/%s", configFolder, "kubeletconfig-mapping.yaml")
+		fContent, err = params.ReadFile(fullPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	mapping := make(map[string]string)
 	err = yaml.Unmarshal(fContent, &mapping)
@@ -74,14 +98,14 @@ func LoadKubeletMapping() (map[string]string, error) {
 
 // SpecInfo spec info with require comand to collect
 type SpecInfo struct {
-	Version    string      `yaml:"version"`
-	Name       string      `yaml:"name"`
-	Title      string      `yaml:"title"`
-	Collectors []Collector `yaml:"collectors"`
+	Version  string    `yaml:"version"`
+	Name     string    `yaml:"name"`
+	Title    string    `yaml:"title"`
+	Commands []Command `yaml:"commands"`
 }
 
 // Collector details of info to collect
-type Collector struct {
+type Command struct {
 	Key      string `yaml:"key"`
 	Title    string `yaml:"title"`
 	Audit    string `yaml:"audit"`
@@ -97,13 +121,18 @@ func getSpecInfo(info string) (*SpecInfo, error) {
 	return &specInfo, nil
 }
 
-func getNodeParams(info string) (*Config, error) {
+func getNodeParams(config string, mapping string) (*Config, *Mapper, error) {
 	var np Config
-	err := yaml.Unmarshal([]byte(info), &np)
+	err := yaml.Unmarshal([]byte(config), &np)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &np, nil
+	var mp Mapper
+	err = yaml.Unmarshal([]byte(mapping), &mp)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &np, &mp, nil
 }
 
 // Node output node data with info results
@@ -121,10 +150,11 @@ type Info struct {
 }
 
 type Config struct {
-	Node           NodeParams               `yaml:"node"`
+	Node NodeParams `yaml:"node"`
+}
+type Mapper struct {
 	VersionMapping map[string][]SpecVersion `yaml:"version_mapping"`
 }
-
 type SpecVersion struct {
 	Name    string
 	Version string `yaml:"cluster_version"`
