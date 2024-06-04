@@ -1,11 +1,14 @@
 package collector
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"reflect"
 	"testing"
 
+	"github.com/dsnet/compress/bzip2"
 	"github.com/stretchr/testify/assert"
 	"sigs.k8s.io/kustomize/kyaml/yaml"
 )
@@ -14,12 +17,14 @@ func TestParseNodeConfig(t *testing.T) {
 	tests := []struct {
 		name                   string
 		nodeConfigFile         string
-		expextedNodeConfigFile map[string]*Info
+		mappingFile            string
+		expectedNodeConfigFile map[string]*Info
 	}{
 		{
 			name:           "parse node config",
 			nodeConfigFile: "./testdata/fixture/node_config.json",
-			expextedNodeConfigFile: map[string]*Info{
+			mappingFile:    "./testdata/fixture/kubeletconfig-mapping.yaml",
+			expectedNodeConfigFile: map[string]*Info{
 				"kubeletAnonymousAuthArgumentSet": {
 					Values: []interface{}{"false"},
 				},
@@ -58,16 +63,36 @@ func TestParseNodeConfig(t *testing.T) {
 			nodeConfig := make(map[string]interface{})
 			err = json.Unmarshal(data, &nodeConfig)
 			assert.NoError(t, err)
-			mapping, err := LoadKubeletMapping("")
+			mf, err := os.ReadFile(tt.mappingFile)
+			assert.NoError(t, err)
+			bzip2CompressData, err := bzip2Compress(mf)
+			assert.NoError(t, err)
+			encodedMapping := base64.StdEncoding.EncodeToString(bzip2CompressData)
+			mapping, err := LoadKubeletMapping(encodedMapping)
 			assert.NoError(t, err)
 			m := getValuesFromkubeletConfig(nodeConfig, mapping)
 			for k, v := range m {
-				if _, ok := tt.expextedNodeConfigFile[k]; ok {
-					assert.Equal(t, v, tt.expextedNodeConfigFile[k])
+				if _, ok := tt.expectedNodeConfigFile[k]; ok {
+					assert.Equal(t, v, tt.expectedNodeConfigFile[k])
 				}
 			}
 		})
 	}
+}
+
+func bzip2Compress(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w, err := bzip2.NewWriter(&buf, &bzip2.WriterConfig{Level: bzip2.DefaultCompression})
+	if err != nil {
+		return []byte{}, err
+	}
+
+	_, err = w.Write(data)
+	if err != nil {
+		return []byte{}, err
+	}
+	w.Close()
+	return buf.Bytes(), nil
 }
 
 func TestSpecByVersionName(t *testing.T) {
@@ -176,13 +201,13 @@ func TestPlatfromVersion(t *testing.T) {
 
 func TestNodeCommamnd(t *testing.T) {
 	tests := []struct {
-		name     string
-		commands string
-		want     []Command
+		name             string
+		commandsFilePath string
+		want             []Command
 	}{
 		{
-			name:     "k8s version",
-			commands: "LS0tCmNvbW1hbmRzOgogIC0ga2V5OiBrdWJlQVBJU2VydmVyU3BlY0ZpbGVQZXJtaXNzaW9uCiAgICB0aXRsZTogQVBJIHNlcnZlciBwb2Qgc3BlY2lmaWNhdGlvbiBmaWxlIHBlcm1pc3Npb25zCiAgICBub2RlVHlwZTogbWFzdGVyCiAgICBhdWRpdDogc3RhdCAtYyAlYSAkYXBpc2VydmVyLmNvbmZzCgo=",
+			name:             "k8s version",
+			commandsFilePath: "./testdata/fixture/single-check.yaml",
 			want: []Command{
 				{
 					Key:      "kubeAPIServerSpecFilePermission",
@@ -196,9 +221,21 @@ func TestNodeCommamnd(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetNodesCommands(tt.commands, nil, "worker", "k8s-cis-1.23.2")
+			fd, err := os.ReadFile(tt.commandsFilePath)
+			assert.NoError(t, err)
+			commands, err := compressAndEncode(fd)
+			assert.NoError(t, err)
+			got, err := GetNodesCommands(string(commands), map[string]string{}, "master")
 			assert.NoError(t, err)
 			assert.True(t, reflect.DeepEqual(got, tt.want))
 		})
 	}
+}
+
+func compressAndEncode(data []byte) (string, error) {
+	cm, err := bzip2Compress(data)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(cm), nil
 }
