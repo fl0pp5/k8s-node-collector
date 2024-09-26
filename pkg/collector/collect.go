@@ -52,6 +52,9 @@ func CollectData(cmd *cobra.Command) error {
 	cm := configParams(lp, shellCmd)
 	nodeCommands := cmd.Flag("node-commands").Value.String()
 	commands, err := GetNodesCommands(nodeCommands, cm, nodeType)
+	if err != nil {
+		return err
+	}
 	if len(commands) == 0 {
 		return fmt.Errorf("spec not found")
 	}
